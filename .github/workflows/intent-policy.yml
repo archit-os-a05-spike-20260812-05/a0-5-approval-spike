@@ -1,0 +1,142 @@
+name: intent-policy
+
+# SHA semantics (documented): for the `pull_request` event GITHUB_REF is
+# `refs/pull/<n>/merge` and GITHUB_SHA is the last merge commit on that ref —
+# the TEST-MERGE commit, not the PR head. This workflow ignores GITHUB_SHA and
+# validates the Git objects reachable from
+# `github.event.pull_request.head.sha`, so it checks exactly what was submitted.
+# Which SHA the resulting check run lands on is NOT assumed here; the harness
+# resolves that from GitHub's own statusCheckRollup at evidence time.
+#
+# Trigger is `pull_request`, not `pull_request_target`: no secrets are exposed.
+# The workflow file is PR-modifiable in principle. That is acceptable only
+# because the Writer App holds no Workflows permission — TEST 1 proves the
+# PUBLICATION invariant: the Writer cannot make any ref point at a commit that
+# changes .github/workflows/**, whichever API layer GitHub chooses to enforce
+# at (R6 does not prescribe one) — CODEOWNERS requires the human approver for
+# `.github/**`, and deleting or renaming this workflow means the required
+# context never reports, so the gate fails closed.
+#
+# Manifest bytes come from the GIT DATA API (commit -> tree -> blob), never the
+# Repository Contents API, which can follow a symlink and return a different
+# file's content. Mode and type are asserted so a symlink (120000), submodule
+# (160000) or executable (100755) entry cannot pass.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: intent-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  intent-policy:
+    name: intent-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate deployment intent
+        # No checkout. No PR-supplied script is sourced or executed. The only
+        # inputs are API responses, parsed with jq. No secrets are referenced.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          ALLOWED_PATH: deploy/intent.json
+          ALLOWED_ENVIRONMENT: spike-nonprod
+          MAX_BYTES: "4096"
+        run: |
+          set -euo pipefail
+
+          fail() { echo "INTENT-POLICY FAIL: $1"; exit 1; }
+          match() { printf '%s' "$2" | grep -Eq "$1" || fail "$3"; }
+
+          # ---- 1. diff gate: exactly one changed file, exactly the manifest ----
+          # Single-page read on purpose: 2..100 changed files -> length >= 2;
+          # >100 -> exactly 100 on page one. Only a true single-file PR yields 1.
+          files_json="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100")"
+          printf '%s' "$files_json" | jq -e 'type == "array"' >/dev/null \
+            || fail "unexpected /files response shape"
+
+          count="$(printf '%s' "$files_json" | jq 'length')"
+          [ "$count" -eq 1 ] || fail "PR must change exactly 1 file, found ${count}"
+
+          name="$(printf '%s' "$files_json" | jq -r '.[0].filename')"
+          [ "$name" = "$ALLOWED_PATH" ] || fail "only ${ALLOWED_PATH} may change (found ${name})"
+
+          status="$(printf '%s' "$files_json" | jq -r '.[0].status')"
+          # The manifest already exists on the base branch, so the only legal
+          # change is a modification. "added" would mean the base fixture moved.
+          [ "$status" = "modified" ] || fail "manifest change status must be 'modified', found ${status}"
+
+          # ---- 2. resolve the manifest as a GIT BLOB at the PR head ----
+          match '^[0-9a-f]{40}$' "$HEAD_SHA" "invalid PR head sha"
+
+          commit_json="$(gh api "repos/${REPO}/git/commits/${HEAD_SHA}")"
+          tree_sha="$(printf '%s' "$commit_json" | jq -r '.tree.sha')"
+          match '^[0-9a-f]{40}$' "$tree_sha" "invalid tree sha"
+
+          tree_json="$(gh api "repos/${REPO}/git/trees/${tree_sha}?recursive=1")"
+          [ "$(printf '%s' "$tree_json" | jq -r '.truncated')" = "false" ] \
+            || fail "tree response truncated; cannot validate deterministically"
+
+          entries="$(printf '%s' "$tree_json" | jq -c --arg p "$ALLOWED_PATH" '[.tree[] | select(.path == $p)]')"
+          n="$(printf '%s' "$entries" | jq 'length')"
+          [ "$n" -eq 1 ] || fail "expected exactly 1 tree entry for ${ALLOWED_PATH}, found ${n}"
+
+          etype="$(printf '%s' "$entries" | jq -r '.[0].type')"
+          emode="$(printf '%s' "$entries" | jq -r '.[0].mode')"
+          eblob="$(printf '%s' "$entries" | jq -r '.[0].sha')"
+          [ "$etype" = "blob" ]   || fail "entry type must be blob (found ${etype})"
+          [ "$emode" = "100644" ] || fail "entry mode must be 100644 (found ${emode}); symlink/submodule/exec rejected"
+          match '^[0-9a-f]{40}$' "$eblob" "invalid blob sha"
+
+          blob_json="$(gh api "repos/${REPO}/git/blobs/${eblob}")"
+          [ "$(printf '%s' "$blob_json" | jq -r '.encoding')" = "base64" ] || fail "blob encoding must be base64"
+          [ "$(printf '%s' "$blob_json" | jq -r '.sha')" = "$eblob" ]      || fail "blob sha mismatch"
+          bsize="$(printf '%s' "$blob_json" | jq -r '.size')"
+          [ "$bsize" -le "$MAX_BYTES" ] || fail "manifest too large (${bsize} bytes)"
+
+          intent="${RUNNER_TEMP}/intent.json"
+          printf '%s' "$blob_json" | jq -r '.content' | tr -d '\n' | base64 -d > "$intent"
+
+          # ---- 3. strict schema ----
+          jq -e 'type == "object"' "$intent" >/dev/null || fail "manifest is not a JSON object"
+          jq -e 'to_entries | map(.value | type == "string") | all' "$intent" >/dev/null \
+            || fail "all manifest values must be strings"
+
+          expected='["environment","image_digest","project","release","schema_version","source_commit_sha"]'
+          actual="$(jq -c 'keys' "$intent")"
+          [ "$actual" = "$expected" ] || fail "manifest keys must be exactly ${expected}, found ${actual}"
+
+          schema_version="$(jq -r '.schema_version' "$intent")"
+          project="$(jq -r '.project' "$intent")"
+          environment="$(jq -r '.environment' "$intent")"
+          release="$(jq -r '.release' "$intent")"
+          source_commit_sha="$(jq -r '.source_commit_sha' "$intent")"
+          image_digest="$(jq -r '.image_digest' "$intent")"
+
+          # ---- 4. field validation, fail closed ----
+          [ "$schema_version" = "1" ] || fail "schema_version must be \"1\""
+          [ "$environment" = "$ALLOWED_ENVIRONMENT" ] || fail "environment must be ${ALLOWED_ENVIRONMENT}"
+          match '^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$' "$project" "invalid project"
+          match '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' "$release" "invalid release"
+          match '^[0-9a-f]{40}$' "$source_commit_sha" "source_commit_sha must be 40 lowercase hex"
+
+          # ---- 5/6. immutable digest; a mutable tag must not substitute ----
+          at_count="$(printf '%s' "$image_digest" | tr -cd '@' | wc -c | tr -d ' ')"
+          [ "$at_count" -eq 1 ] || fail "image_digest must contain exactly one '@'"
+          match '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]{1,5})?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)+@sha256:[0-9a-f]{64}$' \
+            "$image_digest" "image_digest must be registry/path@sha256:<64 hex> with no tag"
+
+          echo "INTENT-POLICY PASS"
+          echo "  blob=${eblob} mode=${emode}"
+          echo "  project=${project} environment=${environment} release=${release}"
+          echo "  source_commit_sha=${source_commit_sha}"
+          echo "  image_digest=${image_digest}"

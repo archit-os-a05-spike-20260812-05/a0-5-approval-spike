@@ -1,0 +1,13 @@
+# Human production approver for the A0.5 spike.
+# CODEOWNERS is evaluated from the BASE branch, so a pull request cannot
+# rewrite the ownership policy that governs its own review requirement.
+# Later patterns win; every pattern here resolves to the same owner.
+
+*                        @arrowmuse-tech
+
+# Restate ownership of the controls themselves, so any attempt to weaken the
+# gate is itself gated.
+/.github/                @arrowmuse-tech
+/.github/CODEOWNERS      @arrowmuse-tech
+/.github/workflows/      @arrowmuse-tech
+/deploy/                 @arrowmuse-tech
