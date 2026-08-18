@@ -2,7 +2,7 @@
   "schema_version": "1",
   "project": "a0-5-spike",
   "environment": "spike-nonprod",
-  "release": "r0-baseline",
-  "source_commit_sha": "0123456789abcdef0123456789abcdef01234567",
-  "image_digest": "ghcr.io/a0-5-spike/a0-5-spike-artifact@sha256:deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+  "release": "r1-first-intent",
+  "source_commit_sha": "89abcdef0123456789abcdef0123456789abcdef",
+  "image_digest": "ghcr.io/a0-5-spike/a0-5-spike-artifact@sha256:feedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedfacefeedface"
 }
